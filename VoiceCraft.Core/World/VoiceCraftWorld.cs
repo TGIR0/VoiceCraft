@@ -97,13 +97,13 @@ namespace VoiceCraft.Core.World
                 OnEntityDestroyed?.Invoke(entity);
         }
 
+        private int _nextId;
+
         private int GetLowestAvailableId()
         {
-            for (var i = 0; i < int.MaxValue; i++)
-                if (!_entities.ContainsKey(i))
-                    return i;
-
-            throw new InvalidOperationException("Could not find an available id!");
+            while (_entities.ContainsKey(_nextId))
+                _nextId++;
+            return _nextId++;
         }
     }
 }
