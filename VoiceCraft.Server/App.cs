@@ -119,14 +119,15 @@ public static class App
         }
     }
     
-    public static void Shutdown(uint delayMs = 0)
+    public static async void Shutdown(uint delayMs = 0)
     {
         if (Cts.IsCancellationRequested || _shuttingDown) return;
         _shuttingDown = true;
         AnsiConsole.MarkupLine(delayMs > 0
             ? $"[bold yellow]{Locales.Locales.Shutdown_StartingIn.Replace("{delayMs}", delayMs.ToString())}[/]"
             : $"[bold yellow]{Locales.Locales.Shutdown_Starting}[/]");
-        Task.Delay((int)delayMs).Wait();
+        if (delayMs > 0)
+            await Task.Delay((int)delayMs);
         Cts.Cancel();
     }
 

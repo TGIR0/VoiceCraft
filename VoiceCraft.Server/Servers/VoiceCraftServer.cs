@@ -320,9 +320,11 @@ public class VoiceCraftServer : IResettable, IDisposable
             var pt = (VcPacketType)packetType;
             ProcessPacket(pt, reader, peer);
         }
-        catch
+        catch (Exception ex)
         {
-            //Do Nothing
+#if DEBUG
+            AnsiConsole.MarkupLine($"[grey]Packet processing error: {ex.Message}[/]");
+#endif
         }
     }
 
@@ -335,9 +337,11 @@ public class VoiceCraftServer : IResettable, IDisposable
             var pt = (VcPacketType)packetType;
             ProcessUnconnectedPacket(pt, reader, remoteEndPoint);
         }
-        catch
+        catch (Exception ex)
         {
-            //Do Nothing
+#if DEBUG
+            AnsiConsole.MarkupLine($"[grey]Unconnected packet error: {ex.Message}[/]");
+#endif
         }
     }
 

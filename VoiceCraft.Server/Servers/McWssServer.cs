@@ -135,9 +135,11 @@ public class McWssServer
                     var pt = (McApiPacketType)packetType;
                     HandlePacket(pt, _reader, peer.Key, peer.Value);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    //Do Nothing
+#if DEBUG
+                    AnsiConsole.MarkupLine($"[grey]McApi packet error: {ex.Message}[/]");
+#endif
                 }
         }
 
@@ -200,9 +202,11 @@ public class McWssServer
                     break;
             }
         }
-        catch
+        catch (Exception ex)
         {
-            //Ignored
+#if DEBUG
+            AnsiConsole.MarkupLine($"[grey]WebSocket message error: {ex.Message}[/]");
+#endif
         }
     }
 
@@ -219,7 +223,6 @@ public class McWssServer
 
         if (!peer.Connected) return;
 
-        // ReSharper disable once UnreachableSwitchCaseDueToIntegerAnalysis
         switch (packetType)
         {
             case McApiPacketType.LogoutRequest:
@@ -231,11 +234,6 @@ public class McWssServer
                 var pingPacket = new McApiPingRequestPacket();
                 pingPacket.Deserialize(reader);
                 HandlePingPacket(pingPacket, peer);
-                break;
-            case McApiPacketType.LoginRequest:
-            case McApiPacketType.AcceptResponse:
-            case McApiPacketType.DenyResponse:
-            default:
                 break;
         }
     }
@@ -278,15 +276,4 @@ public class McWssServer
         SendPacket(netPeer, packet); //Reuse the packet.
     }
 
-    //Resharper disable All
-    private class Rawtext
-    {
-        public RawtextMessage[] rawtext { get; set; } = [];
-    }
-
-    private class RawtextMessage
-    {
-        public string text { get; set; } = string.Empty;
-    }
-    //Resharper enable All
 }
