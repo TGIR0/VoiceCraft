@@ -36,6 +36,7 @@ public class McWssServer
         try
         {
             AnsiConsole.WriteLine(Locales.Locales.McWssServer_Starting);
+            AnsiConsole.MarkupLine($"[yellow]McWss Token: {Config.LoginToken}[/]");
             _wsServer = new WebSocketServer(Config.Hostname);
 
             _wsServer.Start(socket =>

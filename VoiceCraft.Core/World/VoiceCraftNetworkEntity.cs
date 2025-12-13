@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using LiteNetLib;
+using VoiceCraft.Core.Security;
 
 namespace VoiceCraft.Core.World
 {
@@ -21,6 +22,7 @@ namespace VoiceCraft.Core.World
             ServerUserGuid = serverUserGuid;
             Locale = locale;
             PositioningType = positioningType;
+            Security = new NetworkSecurity();
         }
 
         public NetPeer NetPeer { get; }
@@ -28,6 +30,7 @@ namespace VoiceCraft.Core.World
         public Guid ServerUserGuid { get; private set; }
         public string Locale { get; private set; }
         public PositioningType PositioningType { get; }
+        public NetworkSecurity Security { get; }
 
         public override void Reset()
         {

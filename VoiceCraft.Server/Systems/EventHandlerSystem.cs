@@ -332,9 +332,34 @@ public class EventHandlerSystem : IDisposable
                 if (ve is not VoiceCraftNetworkEntity visibleEntity || ve == entity || visibleEntity.Deafened) continue;
                 var packet = PacketPool<VcOnEntityAudioReceivedPacket>.GetPacket()
                     .Set(entity.Id, timestamp, frameLoudness, data.Length, data);
-                _server.SendPacket(visibleEntity.NetPeer, packet);
+                _server.SendPacket(visibleEntity.NetPeer, packet, DeliveryMethod.Unreliable);
             }
         });
+    }
+
+    public void HandleAdvancedAudio(VcAdvancedAudioPacket packet, VoiceCraftNetworkEntity networkEntity)
+    {
+        // Update Spatial Data if present
+        if ((packet.Flags & AudioPacketFlags.HasPosition) != 0)
+        {
+            networkEntity.Position = packet.Position;
+        }
+        if ((packet.Flags & AudioPacketFlags.HasRotation) != 0)
+        {
+            networkEntity.Rotation = packet.Rotation;
+        }
+
+        // Relay to visible entities
+        // We reuse the packet, but ensure EntityId is set to the sender
+        packet.Set(networkEntity.Id, packet.Timestamp, packet.FrameLoudness, packet.Length, packet.Data, 
+            (packet.Flags & AudioPacketFlags.HasPosition) != 0 ? networkEntity.Position : null,
+            (packet.Flags & AudioPacketFlags.HasRotation) != 0 ? networkEntity.Rotation : null);
+
+        foreach (var ve in networkEntity.VisibleEntities)
+        {
+            if (ve is not VoiceCraftNetworkEntity visibleEntity || ve == networkEntity || visibleEntity.Deafened) continue;
+            _server.SendPacket(visibleEntity.NetPeer, packet, DeliveryMethod.Sequenced);
+        }
     }
 
     #endregion

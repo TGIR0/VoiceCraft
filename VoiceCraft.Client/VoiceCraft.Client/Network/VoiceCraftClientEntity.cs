@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Threading.Tasks;
 using OpusSharp.Core;
 using VoiceCraft.Client.Services;
@@ -11,9 +12,12 @@ namespace VoiceCraft.Client.Network;
 public class VoiceCraftClientEntity: VoiceCraftEntity
 {
     private readonly OpusDecoder _decoder = new(Constants.SampleRate, Constants.Channels);
-    private readonly JitterBuffer _jitterBuffer = new(TimeSpan.FromMilliseconds(100));
+    private readonly AdaptiveJitterBuffer _jitterBuffer = new(minBufferMs: 40, maxBufferMs: 200, frameSizeMs: Constants.FrameSizeMs);
     private readonly BufferedAudioProvider16 _outputBuffer = new(Constants.OutputBufferShorts)
         { DiscardOnOverflow = true };
+    
+    // ArrayPool for zero-allocation decoding
+    private static readonly ArrayPool<short> ShortPool = ArrayPool<short>.Shared;
 
     private DateTime _lastPacket = DateTime.MinValue;
     private bool _userMuted;
@@ -71,6 +75,16 @@ public class VoiceCraftClientEntity: VoiceCraftEntity
     public event Action<bool, VoiceCraftClientEntity>? OnUserMutedUpdated;
     public event Action<VoiceCraftClientEntity>? OnStartedSpeaking;
     public event Action<VoiceCraftClientEntity>? OnStoppedSpeaking;
+    
+    /// <summary>
+    /// Jitter buffer statistics for monitoring
+    /// </summary>
+    public JitterBufferStatistics JitterStatistics => _jitterBuffer.Statistics;
+    
+    /// <summary>
+    /// Current adaptive buffer delay in milliseconds
+    /// </summary>
+    public int CurrentBufferDelayMs => _jitterBuffer.CurrentDelayMs;
 
     public VoiceCraftClientEntity(int id, VoiceCraftWorld world) : base(id, world)
     {
@@ -80,10 +94,9 @@ public class VoiceCraftClientEntity: VoiceCraftEntity
     public void ClearBuffer()
     {
         lock(_outputBuffer)
-        lock (_jitterBuffer)
         {
             _outputBuffer.Clear();
-            _jitterBuffer.Reset(); //Also reset the jitter buffer.
+            _jitterBuffer.Reset(); // Also reset the jitter buffer
         }
     }
 
@@ -112,21 +125,16 @@ public class VoiceCraftClientEntity: VoiceCraftEntity
 
     public override void ReceiveAudio(byte[] buffer, ushort timestamp, float frameLoudness)
     {
-        lock (_jitterBuffer)
-        {
-            var packet = new JitterPacket(timestamp, buffer);
-            _jitterBuffer.Add(packet);
-        }
-
+        // Add to adaptive jitter buffer (thread-safe internally)
+        _jitterBuffer.Add(timestamp, buffer, buffer.Length);
         base.ReceiveAudio(buffer, timestamp, frameLoudness);
     }
 
     public override void Destroy()
     {
         lock (_decoder)
-        lock (_jitterBuffer)
         {
-            _jitterBuffer.Reset();
+            _jitterBuffer.Dispose();
             _decoder.Dispose();
         }
 
@@ -144,22 +152,33 @@ public class VoiceCraftClientEntity: VoiceCraftEntity
         if (buffer.Length * sizeof(short) < Constants.BytesPerFrame)
             return 0;
 
-        lock (_jitterBuffer)
+        try
         {
-            try
+            if (_jitterBuffer.TryGet(out var packet, out var isLost))
             {
-                if (!_jitterBuffer.Get(out var packet))
-                    return (DateTime.UtcNow - _lastPacket).TotalMilliseconds > Constants.SilenceThresholdMs
-                        ? 0
-                        : _decoder.Decode(null, 0, buffer, Constants.SamplesPerFrame, false);
-
                 _lastPacket = DateTime.UtcNow;
-                return _decoder.Decode(packet.Data, packet.Data.Length, buffer, Constants.SamplesPerFrame, false);
+                var decoded = _decoder.Decode(packet.Data, packet.DataLength, buffer, Constants.SamplesPerFrame, false);
+                packet.Dispose(); // Return pooled buffer
+                return decoded;
             }
-            catch
+            
+            // Packet Loss Concealment (PLC)
+            if (isLost)
             {
-                return 0;
+                // Use Opus PLC by passing null data
+                return _decoder.Decode(null, 0, buffer, Constants.SamplesPerFrame, true);
             }
+            
+            // No packet available and not lost - check if we should generate comfort noise
+            if ((DateTime.UtcNow - _lastPacket).TotalMilliseconds > Constants.SilenceThresholdMs)
+                return 0;
+            
+            // Generate PLC for smooth audio
+            return _decoder.Decode(null, 0, buffer, Constants.SamplesPerFrame, false);
+        }
+        catch
+        {
+            return 0;
         }
     }
 

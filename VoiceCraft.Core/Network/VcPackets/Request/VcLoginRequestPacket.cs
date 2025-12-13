@@ -34,6 +34,7 @@ namespace VoiceCraft.Core.Network.VcPackets.Request
         public string Locale { get; private set; }
         public Version Version { get; private set; }
         public PositioningType PositioningType { get; private set; }
+        public byte[] PublicKey { get; private set; } = Array.Empty<byte>();
 
         public void Serialize(NetDataWriter writer)
         {
@@ -45,6 +46,7 @@ namespace VoiceCraft.Core.Network.VcPackets.Request
             writer.Put(Version.Minor);
             writer.Put(Version.Build);
             writer.Put((byte)PositioningType);
+            writer.PutBytesWithLength(PublicKey);
         }
 
         public void Deserialize(NetDataReader reader)
@@ -55,6 +57,7 @@ namespace VoiceCraft.Core.Network.VcPackets.Request
             Locale = reader.GetString(Constants.MaxStringLength);
             Version = new Version(reader.GetInt(), reader.GetInt(), reader.GetInt());
             PositioningType = (PositioningType)reader.GetByte();
+            PublicKey = reader.GetBytesWithLength();
         }
 
         public VcLoginRequestPacket Set(
@@ -63,7 +66,8 @@ namespace VoiceCraft.Core.Network.VcPackets.Request
             Guid serverUserGuid = new Guid(),
             string locale = "",
             Version? version = null,
-            PositioningType positioningType = PositioningType.Server)
+            PositioningType positioningType = PositioningType.Server,
+            byte[]? publicKey = null)
         {
             RequestId = requestId;
             UserGuid = userGuid;
@@ -71,6 +75,7 @@ namespace VoiceCraft.Core.Network.VcPackets.Request
             Locale = locale;
             Version = version ?? new Version(0, 0, 0);
             PositioningType = positioningType;
+            PublicKey = publicKey ?? Array.Empty<byte>();
             return this;
         }
     }

@@ -1,4 +1,5 @@
 using System.Net;
+using System.Linq;
 using LiteNetLib;
 using LiteNetLib.Utils;
 using Spectre.Console;
@@ -10,6 +11,7 @@ using VoiceCraft.Core.Network.VcPackets.Response;
 using VoiceCraft.Core.World;
 using VoiceCraft.Server.Config;
 using VoiceCraft.Server.Systems;
+using VoiceCraft.Server;
 
 namespace VoiceCraft.Server.Servers;
 
@@ -177,8 +179,26 @@ public class VoiceCraftServer : IResettable, IDisposable
             lock (_dataWriter)
             {
                 _dataWriter.Reset();
-                _dataWriter.Put((byte)packet.PacketType);
-                packet.Serialize(_dataWriter);
+                
+                if (peer.Tag is VoiceCraftNetworkEntity entity && entity.Security.IsHandshakeComplete && packet.PacketType != VcPacketType.LoginRequest)
+                {
+                    _dataWriter.Put((byte)packet.PacketType);
+                    packet.Serialize(_dataWriter);
+                    var packetData = _dataWriter.CopyData();
+                    var (encryptedData, iv, tag) = entity.Security.Encrypt(packetData);
+                    
+                    var encryptedPacket = PacketPool<VcEncryptedPacket>.GetPacket().Set(iv, tag, encryptedData);
+                    _dataWriter.Reset();
+                    _dataWriter.Put((byte)VcPacketType.EncryptedPacket);
+                    encryptedPacket.Serialize(_dataWriter);
+                    PacketPool<VcEncryptedPacket>.Return(encryptedPacket);
+                }
+                else
+                {
+                    _dataWriter.Put((byte)packet.PacketType);
+                    packet.Serialize(_dataWriter);
+                }
+                
                 peer.Send(_dataWriter, deliveryMethod);
                 return true;
             }
@@ -196,41 +216,37 @@ public class VoiceCraftServer : IResettable, IDisposable
         {
             lock (_dataWriter)
             {
+                var networkEntities = World.Entities.OfType<VoiceCraftNetworkEntity>();
+                
+                // We must handle encryption per client, so we can't just reuse the same buffer for everyone if they have different keys.
+                // However, we can optimize by serializing the packet once.
                 _dataWriter.Reset();
                 _dataWriter.Put((byte)packet.PacketType);
                 packet.Serialize(_dataWriter);
+                var rawPacketData = _dataWriter.CopyData(); // Copy because we might reuse _dataWriter
 
-                var status = true;
-                foreach (var peer in peers)
+                foreach (var networkEntity in networkEntities)
                 {
-                    if (peer.ConnectionState != ConnectionState.Connected)
+                    if (peers.Contains(networkEntity.NetPeer))
                     {
-                        status = false;
-                        continue;
+                        if (networkEntity.Security.IsHandshakeComplete)
+                        {
+                            var (encryptedData, iv, tag) = networkEntity.Security.Encrypt(rawPacketData);
+                            var encryptedPacket = PacketPool<VcEncryptedPacket>.GetPacket().Set(iv, tag, encryptedData);
+                            
+                            _dataWriter.Reset();
+                            _dataWriter.Put((byte)VcPacketType.EncryptedPacket);
+                            encryptedPacket.Serialize(_dataWriter);
+                            networkEntity.NetPeer.Send(_dataWriter, deliveryMethod);
+                            PacketPool<VcEncryptedPacket>.Return(encryptedPacket);
+                        }
+                        else
+                        {
+                            // Send raw
+                            networkEntity.NetPeer.Send(rawPacketData, deliveryMethod);
+                        }
                     }
-
-                    peer.Send(_dataWriter, deliveryMethod);
                 }
-
-                return status;
-            }
-        }
-        finally
-        {
-            PacketPool<T>.Return(packet);
-        }
-    }
-
-    public bool SendUnconnectedPacket<T>(IPEndPoint remoteEndPoint, T packet) where T : IVoiceCraftPacket
-    {
-        try
-        {
-            lock (_dataWriter)
-            {
-                _dataWriter.Reset();
-                _dataWriter.Put((byte)packet.PacketType);
-                packet.Serialize(_dataWriter);
-                return _netManager.SendUnconnectedMessage(_dataWriter, remoteEndPoint);
             }
         }
         finally
@@ -247,13 +263,34 @@ public class VoiceCraftServer : IResettable, IDisposable
             lock (_dataWriter)
             {
                 var networkEntities = World.Entities.OfType<VoiceCraftNetworkEntity>();
+                
+                // We must handle encryption per client, so we can't just reuse the same buffer for everyone if they have different keys.
+                // However, we can optimize by serializing the packet once.
                 _dataWriter.Reset();
                 _dataWriter.Put((byte)packet.PacketType);
                 packet.Serialize(_dataWriter);
+                var rawPacketData = _dataWriter.CopyData(); // Copy because we might reuse _dataWriter
+
                 foreach (var networkEntity in networkEntities)
                 {
                     if (excludes.Contains(networkEntity.NetPeer)) continue;
-                    networkEntity.NetPeer.Send(_dataWriter, deliveryMethod);
+                    
+                    if (networkEntity.Security.IsHandshakeComplete)
+                    {
+                        var (encryptedData, iv, tag) = networkEntity.Security.Encrypt(rawPacketData);
+                        var encryptedPacket = PacketPool<VcEncryptedPacket>.GetPacket().Set(iv, tag, encryptedData);
+                        
+                        _dataWriter.Reset();
+                        _dataWriter.Put((byte)VcPacketType.EncryptedPacket);
+                        encryptedPacket.Serialize(_dataWriter);
+                        networkEntity.NetPeer.Send(_dataWriter, deliveryMethod);
+                        PacketPool<VcEncryptedPacket>.Return(encryptedPacket);
+                    }
+                    else
+                    {
+                        // Send raw
+                        networkEntity.NetPeer.Send(rawPacketData, deliveryMethod);
+                    }
                 }
             }
         }
@@ -350,6 +387,28 @@ public class VoiceCraftServer : IResettable, IDisposable
     {
         switch (packetType)
         {
+            case VcPacketType.EncryptedPacket:
+                if (peer.Tag is not VoiceCraftNetworkEntity entity) return;
+                var encryptedPacket = PacketPool<VcEncryptedPacket>.GetPacket();
+                encryptedPacket.Deserialize(reader);
+                try
+                {
+                    var decryptedData = entity.Security.Decrypt(encryptedPacket.EncryptedData, encryptedPacket.Iv, encryptedPacket.Tag);
+                    var decryptedReader = new NetPacketReader(decryptedData);
+                    var innerPacketType = (VcPacketType)decryptedReader.GetByte();
+                    ProcessPacket(innerPacketType, decryptedReader, peer);
+                }
+                catch (Exception ex)
+                {
+#if DEBUG
+                    AnsiConsole.MarkupLine($"[grey]Decryption error: {ex.Message}[/]");
+#endif
+                }
+                finally
+                {
+                    PacketPool<VcEncryptedPacket>.Return(encryptedPacket);
+                }
+                break;
             case VcPacketType.AudioRequest:
                 var audioRequestPacket = PacketPool<VcAudioRequestPacket>.GetPacket();
                 audioRequestPacket.Deserialize(reader);
@@ -393,8 +452,12 @@ public class VoiceCraftServer : IResettable, IDisposable
             var peer = request.Accept();
             try
             {
-                World.CreateEntity(peer, packet.UserGuid, packet.ServerUserGuid, packet.Locale, packet.PositioningType);
-                SendPacket(peer, PacketPool<VcAcceptResponsePacket>.GetPacket().Set(packet.RequestId));
+                var entity = World.CreateEntity(peer, packet.UserGuid, packet.ServerUserGuid, packet.Locale, packet.PositioningType);
+                if (packet.PublicKey.Length > 0)
+                {
+                    entity.Security.CompleteHandshake(packet.PublicKey);
+                }
+                SendPacket(peer, PacketPool<VcAcceptResponsePacket>.GetPacket().Set(packet.RequestId, entity.Security.PublicKey));
             }
             catch
             {
@@ -419,6 +482,21 @@ public class VoiceCraftServer : IResettable, IDisposable
         finally
         {
             PacketPool<VcInfoRequestPacket>.Return(packet);
+        }
+    }
+
+    private void HandleAdvancedAudioPacket(VcAdvancedAudioPacket packet, NetPeer peer)
+    {
+        try
+        {
+            if (peer.Tag is not VoiceCraftNetworkEntity networkEntity) return;
+            // Delegate to EventHandlerSystem to handle spatial updates and relay
+            var eventHandler = Program.ServiceProvider.GetRequiredService<EventHandlerSystem>();
+            eventHandler.HandleAdvancedAudio(packet, networkEntity);
+        }
+        finally
+        {
+            PacketPool<VcAdvancedAudioPacket>.Return(packet);
         }
     }
 

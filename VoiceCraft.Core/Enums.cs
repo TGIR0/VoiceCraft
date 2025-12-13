@@ -16,6 +16,8 @@ namespace VoiceCraft.Core
         LogoutRequest,
         SetNameRequest,
         AudioRequest,
+        AdvancedAudio,
+        EncryptedPacket,
         SetMuteRequest,
         SetDeafenRequest,
         SetTitleRequest,

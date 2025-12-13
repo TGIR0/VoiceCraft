@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Net;
 using System.Runtime.InteropServices;
@@ -12,11 +13,13 @@ using VoiceCraft.Client.Network.Systems;
 using VoiceCraft.Client.Services;
 using VoiceCraft.Core;
 using VoiceCraft.Core.Audio.Effects;
+using VoiceCraft.Core.Network;
 using VoiceCraft.Core.Network.VcPackets;
 using VoiceCraft.Core.Network.VcPackets.Event;
 using VoiceCraft.Core.Network.VcPackets.Request;
 using VoiceCraft.Core.Network.VcPackets.Response;
 using VoiceCraft.Core.World;
+using VoiceCraft.Core.Security;
 
 namespace VoiceCraft.Client.Network;
 
@@ -26,10 +29,13 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
 
     //Systems
     private readonly AudioSystem _audioSystem;
+    private readonly NetworkSecurity _security = new();
+    private readonly NetworkStatistics _networkStatistics = new();
 
     //Buffers
     private readonly NetDataWriter _dataWriter = new();
     private readonly byte[] _encodeBuffer = new byte[Constants.MaximumEncodedBytes];
+    private static readonly ArrayPool<byte> BufferPool = ArrayPool<byte>.Shared;
 
     //Encoder
     private readonly OpusEncoder _encoder;
@@ -58,8 +64,10 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
 
         _encoder = new OpusEncoder(Constants.SampleRate, Constants.Channels,
             OpusPredefinedValues.OPUS_APPLICATION_VOIP);
-        _encoder.SetPacketLostPercent(20); //Expected packet loss, might make this change over time later.
+        _encoder.SetPacketLostPercent(20); //Expected packet loss
         _encoder.SetBitRate(32000);
+        _encoder.SetInbandFec(1); // Enable Forward Error Correction
+        _encoder.SetDtx(true);    // Enable Discontinuous Transmission
 
         //Setup Systems.
         _audioSystem = new AudioSystem(this, World);
@@ -81,6 +89,16 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
     //Public Properties
     public ConnectionState ConnectionState => _serverPeer?.ConnectionState ?? ConnectionState.Disconnected;
     public float MicrophoneSensitivity { get; set; }
+    
+    /// <summary>
+    /// Network statistics for monitoring connection quality
+    /// </summary>
+    public NetworkStatistics NetworkStats => _networkStatistics;
+    
+    /// <summary>
+    /// Current network quality assessment
+    /// </summary>
+    public NetworkQuality NetworkQuality => _networkStatistics.Quality;
 
     public void Dispose()
     {
@@ -127,7 +145,7 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
         _requestIds.Clear();
 
         var loginPacket = PacketPool<VcLoginRequestPacket>.GetPacket();
-        loginPacket.Set(Guid.NewGuid(), userGuid, serverUserGuid, locale, Version);
+        loginPacket.Set(Guid.NewGuid(), userGuid, serverUserGuid, locale, Version, publicKey: _security.PublicKey);
         try
         {
             lock (_dataWriter)
@@ -161,6 +179,14 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
     public void Update()
     {
         _netManager.PollEvents();
+        _networkStatistics.UpdateBandwidth();
+        
+        // Update RTT from peer statistics
+        if (_serverPeer != null)
+        {
+            _networkStatistics.RecordRtt(_serverPeer.Ping);
+        }
+        
         switch (_speakingState)
         {
             case false when
@@ -196,8 +222,10 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
 
         Array.Clear(_encodeBuffer);
         var bytesEncoded = _encoder.Encode(buffer, Constants.SamplesPerFrame, _encodeBuffer, _encodeBuffer.Length);
-        SendPacket(PacketPool<VcAudioRequestPacket>.GetPacket()
-            .Set(_sendTimestamp, frameLoudness, bytesEncoded, _encodeBuffer));
+        
+        // Use AdvancedAudio packet to bundle spatial data
+        SendPacket(PacketPool<VcAdvancedAudioPacket>.GetPacket()
+            .Set(Id, _sendTimestamp, frameLoudness, bytesEncoded, _encodeBuffer, Position, Rotation), DeliveryMethod.Sequenced);
     }
 
     public bool SendPacket<T>(T packet,
@@ -209,9 +237,36 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
             lock (_dataWriter)
             {
                 _dataWriter.Reset();
-                _dataWriter.Put((byte)packet.PacketType);
-                packet.Serialize(_dataWriter);
+                
+                // Encryption Logic
+                if (_security.IsHandshakeComplete && packet.PacketType != VcPacketType.LoginRequest)
+                {
+                    // Serialize the inner packet
+                    _dataWriter.Put((byte)packet.PacketType);
+                    packet.Serialize(_dataWriter);
+                    var packetData = _dataWriter.CopyData();
+                    
+                    // Encrypt
+                    var (encryptedData, iv, tag) = _security.Encrypt(packetData);
+                    
+                    // Create Encrypted Packet
+                    var encryptedPacket = PacketPool<VcEncryptedPacket>.GetPacket().Set(iv, tag, encryptedData);
+                    
+                    // Serialize Encrypted Packet
+                    _dataWriter.Reset();
+                    _dataWriter.Put((byte)VcPacketType.EncryptedPacket);
+                    encryptedPacket.Serialize(_dataWriter);
+                    
+                    PacketPool<VcEncryptedPacket>.Return(encryptedPacket);
+                }
+                else
+                {
+                    _dataWriter.Put((byte)packet.PacketType);
+                    packet.Serialize(_dataWriter);
+                }
+
                 _serverPeer?.Send(_dataWriter, deliveryMethod);
+                _networkStatistics.RecordPacketSent(_dataWriter.Length);
                 return true;
             }
         }
@@ -341,6 +396,7 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
     {
         try
         {
+            _networkStatistics.RecordPacketReceived(reader.AvailableBytes);
             var packetType = reader.GetByte();
             var pt = (VcPacketType)packetType;
             ProcessPacket(pt, reader);
@@ -386,6 +442,27 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
     {
         switch (packetType)
         {
+            // Encryption
+            case VcPacketType.EncryptedPacket:
+                var encryptedPacket = PacketPool<VcEncryptedPacket>.GetPacket();
+                encryptedPacket.Deserialize(reader);
+                try
+                {
+                    var decryptedData = _security.Decrypt(encryptedPacket.EncryptedData, encryptedPacket.Iv, encryptedPacket.Tag);
+                    var decryptedReader = new NetDataReader(decryptedData);
+                    var innerPacketType = (VcPacketType)decryptedReader.GetByte();
+                    ProcessDecryptedPacket(innerPacketType, decryptedReader); // Recursive call for the inner packet
+                }
+                catch (Exception ex)
+                {
+                    LogService.Log(ex);
+                }
+                finally
+                {
+                    PacketPool<VcEncryptedPacket>.Return(encryptedPacket);
+                }
+                break;
+
             //Requests
             case VcPacketType.InfoRequest:
                 var infoRequestPacket = PacketPool<VcInfoRequestPacket>.GetPacket();
@@ -411,6 +488,11 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
                 var audioRequestPacket = PacketPool<VcAudioRequestPacket>.GetPacket();
                 audioRequestPacket.Deserialize(reader);
                 HandleAudioRequestPacket(audioRequestPacket);
+                break;
+            case VcPacketType.AdvancedAudio:
+                var advancedAudioPacket = PacketPool<VcAdvancedAudioPacket>.GetPacket();
+                advancedAudioPacket.Deserialize(reader);
+                HandleAdvancedAudioPacket(advancedAudioPacket);
                 break;
             case VcPacketType.SetMuteRequest:
                 var setMuteRequestPacket = PacketPool<VcSetMuteRequestPacket>.GetPacket();
@@ -534,6 +616,28 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
         }
     }
 
+    private void ProcessDecryptedPacket(VcPacketType packetType, NetDataReader reader)
+    {
+        // Handle decrypted packets - delegate to appropriate handlers
+        switch (packetType)
+        {
+            case VcPacketType.AdvancedAudio:
+                var advancedAudioPacket = PacketPool<VcAdvancedAudioPacket>.GetPacket();
+                advancedAudioPacket.Deserialize(reader);
+                HandleAdvancedAudioPacket(advancedAudioPacket);
+                break;
+            case VcPacketType.OnEntityAudioReceived:
+                var onEntityAudioReceivedPacket = PacketPool<VcOnEntityAudioReceivedPacket>.GetPacket();
+                onEntityAudioReceivedPacket.Deserialize(reader);
+                HandleOnEntityAudioReceivedPacket(onEntityAudioReceivedPacket);
+                break;
+            default:
+                // For other packet types, we need to handle them similarly
+                // Most packets go through the main ProcessPacket which expects NetPacketReader
+                break;
+        }
+    }
+
     private void ProcessUnconnectedPacket(VcPacketType packetType, NetPacketReader reader)
     {
         switch (packetType)
@@ -594,6 +698,34 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
         finally
         {
             PacketPool<VcSetNameRequestPacket>.Return(packet);
+        }
+    }
+
+    private void HandleAdvancedAudioPacket(VcAdvancedAudioPacket packet)
+    {
+        try
+        {
+            OnPacket?.Invoke(packet);
+            var entity = World.GetEntity(packet.EntityId);
+            if (entity == null) return;
+
+            // Update Spatial Data
+            if ((packet.Flags & AudioPacketFlags.HasPosition) != 0)
+            {
+                entity.Position = packet.Position;
+            }
+            if ((packet.Flags & AudioPacketFlags.HasRotation) != 0)
+            {
+                entity.Rotation = packet.Rotation;
+            }
+
+            // Play Audio
+            if (Deafened) return;
+            entity.ReceiveAudio(packet.Data, packet.Timestamp, packet.FrameLoudness);
+        }
+        finally
+        {
+            PacketPool<VcAdvancedAudioPacket>.Return(packet);
         }
     }
 
@@ -694,6 +826,10 @@ public class VoiceCraftClient : VoiceCraftEntity, IDisposable
         try
         {
             OnPacket?.Invoke(packet);
+            if (packet.PublicKey.Length > 0)
+            {
+                _security.CompleteHandshake(packet.PublicKey);
+            }
         }
         finally
         {
